@@ -4812,10 +4812,6 @@ void Board320_240::netLoop()
 
   const auto abrpConfigured = [this]() -> bool
   {
-    if (liveData->settings.remoteUploadAbrpIntervalSec == 0)
-    {
-      return false;
-    }
     const char *token = liveData->settings.abrpApiToken;
     if (token == nullptr || token[0] == '\0')
     {
@@ -4897,15 +4893,29 @@ void Board320_240::netLoop()
     lastNetSendDurationMs = static_cast<uint32_t>((endTime - startTime) / 1000);
   }
 
-  // Upload to ABRP (interval stored in 0.5-second steps: 1 => 0.5s, 10 => 5.0s)
+  // Upload minimal ABRP telemetry every 100ms (utc, lat, lon, speed, power).
+  if (netReady && abrpConfigured)
+  {
+    const uint32_t abrpFastIntervalMs = 100;
+    if (lastAbrpFastSendAtMs == 0 || (millis() - lastAbrpFastSendAtMs) > abrpFastIntervalMs)
+    {
+      syslog->info(DEBUG_COMM, "ABRP fast send tick");
+      int64_t startTime = esp_timer_get_time();
+      sendAbrpTelemetry(true);
+      int64_t endTime = esp_timer_get_time();
+      lastNetSendDurationMs = static_cast<uint32_t>((endTime - startTime) / 1000);
+    }
+  }
+
+  // Upload full ABRP payload using configurable interval (stored in 0.5-second steps: 1 => 0.5s, 10 => 5.0s)
   if (netReady && abrpConfigured)
   {
     const uint32_t abrpIntervalMs = static_cast<uint32_t>(liveData->settings.remoteUploadAbrpIntervalSec) * 500;
     if (abrpIntervalMs > 0 && (lastAbrpSendAtMs == 0 || (millis() - lastAbrpSendAtMs) > abrpIntervalMs))
     {
-      syslog->info(DEBUG_COMM, "ABRP send tick");
+      syslog->info(DEBUG_COMM, "ABRP full send tick");
       int64_t startTime = esp_timer_get_time();
-      netSendData(true);
+      sendAbrpTelemetry(false);
       int64_t endTime = esp_timer_get_time();
       lastNetSendDurationMs = static_cast<uint32_t>((endTime - startTime) / 1000);
     }
@@ -5034,7 +5044,6 @@ bool Board320_240::netSendData(bool sendAbrp)
     jsonData["cumulativeEnergyChargedKWh"] = liveData->params.cumulativeEnergyChargedKWh;
     jsonData["cumulativeEnergyDischargedKWh"] = liveData->params.cumulativeEnergyDischargedKWh;
 
-    // Send GPS data via GPRS (if enabled && valid)
     if (isGpsFixUsable(liveData))
     {
       jsonData["gpsLat"] = liveData->params.gpsLat;
@@ -5061,11 +5070,9 @@ bool Board320_240::netSendData(bool sendAbrp)
       syslog->println("Sending data to remote API");
     }
 
-    // WIFI remote upload
     rc = 0;
     if (liveData->settings.remoteUploadModuleType == REMOTE_UPLOAD_WIFI && liveData->settings.wifiEnabled == 1)
     {
-      // MQTT
       WiFiClient wClient;
       if (liveData->settings.mqttEnabled == 1)
       {
@@ -5100,6 +5107,9 @@ bool Board320_240::netSendData(bool sendAbrp)
           strcpy(topic + strlen(liveData->settings.mqttPubTopic), "/batMaxC");
           dtostrf(liveData->params.batMaxC, 1, 2, tmpVal);
           client.publish(topic, tmpVal);
+          strcpy(topic + strlen(liveData->settings.mqttPubTopic), "/batInletC");
+          dtostrf(liveData->params.batInletC, 1, 2, tmpVal);
+          client.publish(topic, tmpVal);
           strcpy(topic + strlen(liveData->settings.mqttPubTopic), "/extTemp");
           dtostrf(liveData->params.outdoorTemperature, 1, 2, tmpVal);
           client.publish(topic, tmpVal);
@@ -5109,14 +5119,14 @@ bool Board320_240::netSendData(bool sendAbrp)
           strcpy(topic + strlen(liveData->settings.mqttPubTopic), "/odoKm");
           dtostrf(liveData->params.odoKm, 1, 2, tmpVal);
           client.publish(topic, tmpVal);
-          // Send GPS data via GPRS (if enabled && valid)
           if (isGpsFixUsable(liveData))
           {
             strcpy(topic + strlen(liveData->settings.mqttPubTopic), "/gpsLat");
-            dtostrf(liveData->params.gpsLat, 1, 2, tmpVal);
+            dtostrf(liveData->params.gpsLat, 1, 5, tmpVal);
             client.publish(topic, tmpVal);
+
             strcpy(topic + strlen(liveData->settings.mqttPubTopic), "/gpsLon");
-            dtostrf(liveData->params.gpsLon, 1, 2, tmpVal);
+            dtostrf(liveData->params.gpsLon, 1, 5, tmpVal);
             client.publish(topic, tmpVal);
 
             strcpy(topic + strlen(liveData->settings.mqttPubTopic), "/gpsSpeed");
@@ -5139,7 +5149,6 @@ bool Board320_240::netSendData(bool sendAbrp)
       }
       else
       {
-        // Standard http post
         HTTPClient http;
 
         http.begin(wClient, liveData->settings.remoteApiUrl);
@@ -5159,58 +5168,74 @@ bool Board320_240::netSendData(bool sendAbrp)
     }
     else
     {
-      // Failed...
       syslog->print("HTTP POST error: ");
       syslog->println(rc);
       updateNetAvailability(false);
     }
   }
-  else if (sendAbrp && liveData->settings.remoteUploadAbrpIntervalSec != 0)
+  else if (sendAbrp)
   {
-    if (strlen(liveData->settings.abrpApiToken) == 0 ||
-        strcmp(liveData->settings.abrpApiToken, "empty") == 0 ||
-        strcmp(liveData->settings.abrpApiToken, "not_set") == 0)
-    {
-      syslog->println("ABRP token not set, skipping send");
-      return false;
-    }
+    return sendAbrpTelemetry(false);
+  }
+  else
+  {
+    syslog->println("Well... This not gonna happen... (Board320_240::netSendData();)");
+  }
+  // next three rows are for time measurement of this function
+  int64_t endTime2 = esp_timer_get_time();
+  int64_t duration2 = endTime2 - startTime2;
+  (void)duration2;
 
-    StaticJsonDocument<768> jsonData;
+  return true;
+}
 
+bool Board320_240::sendAbrpTelemetry(bool fastPayload)
+{
+  if (strlen(liveData->settings.abrpApiToken) == 0 ||
+      strcmp(liveData->settings.abrpApiToken, "empty") == 0 ||
+      strcmp(liveData->settings.abrpApiToken, "not_set") == 0)
+  {
+    syslog->println("ABRP token not set, skipping send");
+    return false;
+  }
+
+  StaticJsonDocument<768> jsonData;
+
+  if (!fastPayload)
+  {
     jsonData["car_model"] = getCarModelAbrpStr(liveData->settings.carType);
     if (strcmp(jsonData["car_model"], "n/a") == 0)
     {
       syslog->println("Car not supported by ABRP Uploader");
       return false;
     }
+  }
 
-    // evDash uses negative values for discharge/consumption.
-    // ABRP expects the opposite sign convention (consumption positive, charge/regen negative).
-    const float abrpPowerKw = -liveData->params.batPowerKw;
-    const float abrpCurrentA = -liveData->params.batPowerAmp;
+  const float abrpPowerKw = -liveData->params.batPowerKw;
+  const float abrpCurrentA = -liveData->params.batPowerAmp;
 
-    jsonData["utc"] = liveData->params.currentTime;
+  jsonData["utc"] = liveData->params.currentTime;
+  jsonData["power"] = abrpPowerKw;
+  if (liveData->params.speedKmhGPS > 0)
+    jsonData["speed"] = liveData->params.speedKmhGPS;
+  else
+    jsonData["speed"] = liveData->params.speedKmh;
+
+  if (isGpsFixUsable(liveData))
+  {
+    jsonData["lat"] = liveData->params.gpsLat;
+    jsonData["lon"] = liveData->params.gpsLon;
+    if (!fastPayload)
+      jsonData["elevation"] = liveData->params.gpsAlt;
+  }
+
+  if (!fastPayload)
+  {
     jsonData["soc"] = liveData->params.socPerc;
-    jsonData["power"] = abrpPowerKw;
     jsonData["is_parked"] = (liveData->params.parkModeOrNeutral) ? 1 : 0;
-    if (liveData->params.speedKmhGPS > 0)
-    {
-      jsonData["speed"] = liveData->params.speedKmhGPS;
-    }
-    else
-    {
-      jsonData["speed"] = liveData->params.speedKmh;
-    }
     jsonData["is_charging"] = (liveData->params.chargingOn) ? 1 : 0;
     if (liveData->params.chargingOn)
       jsonData["is_dcfc"] = (liveData->params.chargerDCconnected) ? 1 : 0;
-
-    if (isGpsFixUsable(liveData))
-    {
-      jsonData["lat"] = liveData->params.gpsLat;
-      jsonData["lon"] = liveData->params.gpsLon;
-      jsonData["elevation"] = liveData->params.gpsAlt;
-    }
     if (liveData->params.gpsHeadingDeg >= 0)
       jsonData["heading"] = liveData->params.gpsHeadingDeg;
 
@@ -5228,126 +5253,90 @@ bool Board320_240::netSendData(bool sendAbrp)
     jsonData["soh"] = liveData->params.sohPerc;
     jsonData["ext_temp"] = liveData->params.outdoorTemperature;
     if (liveData->params.indoorTemperature != -100)
-    {
       jsonData["cabin_temp"] = liveData->params.indoorTemperature;
-    }
     jsonData["batt_temp"] = liveData->params.batMinC;
     jsonData["voltage"] = liveData->params.batVoltage;
     jsonData["current"] = abrpCurrentA;
     if (liveData->params.odoKm > 0)
       jsonData["odometer"] = liveData->params.odoKm;
+  }
 
-    size_t payloadLength = serializeJson(jsonData, gAbrpPayloadBuffer, sizeof(gAbrpPayloadBuffer));
-    if (payloadLength == 0)
-    {
-      syslog->println("Failed to serialize ABRP payload");
-      return false;
-    }
+  size_t payloadLength = serializeJson(jsonData, gAbrpPayloadBuffer, sizeof(gAbrpPayloadBuffer));
+  if (payloadLength == 0)
+  {
+    syslog->println("Failed to serialize ABRP payload");
+    return false;
+  }
 
-    const size_t payloadStringLength = strlen(gAbrpPayloadBuffer);
-    syslog->println("ABRP payload length (serializeJson): " + String(payloadLength));
-    syslog->println("ABRP payload length (strlen): " + String(payloadStringLength));
-    if (payloadStringLength != payloadLength)
-    {
-      syslog->println("ABRP payload length mismatch detected");
-    }
-    syslog->println("ABRP payload JSON: " + String(gAbrpPayloadBuffer));
-
+  if (!fastPayload)
+  {
     if (liveData->settings.abrpSdcardLog != 0 && liveData->settings.remoteUploadAbrpIntervalSec > 0)
     {
       queueAbrpSdLog(gAbrpPayloadBuffer, payloadLength, liveData->params.currentTime, liveData->params.operationTimeSec, liveData->params.currTimeSyncWithGps);
     }
+    syslog->println("ABRP payload JSON: " + String(gAbrpPayloadBuffer));
+  }
 
-    encodeQuotes(gAbrpEncodedPayloadBuffer, sizeof(gAbrpEncodedPayloadBuffer), gAbrpPayloadBuffer);
-    syslog->println("ABRP encoded payload length: " + String(strlen(gAbrpEncodedPayloadBuffer)));
+  encodeQuotes(gAbrpEncodedPayloadBuffer, sizeof(gAbrpEncodedPayloadBuffer), gAbrpPayloadBuffer);
+  int dtaLength = snprintf(gAbrpFormBuffer, sizeof(gAbrpFormBuffer), "api_key=%s&token=%s&tlm=%s", ABRP_API_KEY, liveData->settings.abrpApiToken, gAbrpEncodedPayloadBuffer);
+  if (dtaLength < 0 || static_cast<size_t>(dtaLength) >= sizeof(gAbrpFormBuffer))
+  {
+    syslog->println("ABRP payload too large, skipping send");
+    return false;
+  }
 
-    int dtaLength = snprintf(gAbrpFormBuffer, sizeof(gAbrpFormBuffer), "api_key=%s&token=%s&tlm=%s", ABRP_API_KEY, liveData->settings.abrpApiToken, gAbrpEncodedPayloadBuffer);
-    if (dtaLength < 0 || static_cast<size_t>(dtaLength) >= sizeof(gAbrpFormBuffer))
-    {
-      syslog->println("ABRP payload too large, skipping send");
-      return false;
-    }
-
-    syslog->println("ABRP form payload length: " + String(dtaLength));
-
-    if (netDebug)
-    {
-      syslog->print("Sending data: ");
-      syslog->println(gAbrpFormBuffer); // dta is total string sent to ABRP API including api-key and user-token (could be sensitive data to log)
-    }
+  int rc = 0;
+  if (liveData->settings.remoteUploadModuleType == REMOTE_UPLOAD_WIFI && liveData->settings.wifiEnabled == 1)
+  {
+    if (fastPayload)
+      lastAbrpFastSendAtMs = millis();
     else
     {
-      syslog->println("Sending data to ABRP");
-    }
-
-    // Code for sending https data to ABRP api server
-    rc = 0;
-    if (liveData->settings.remoteUploadModuleType == REMOTE_UPLOAD_WIFI && liveData->settings.wifiEnabled == 1)
-    {
-      // Track ABRP attempt time only when payload is valid and we're about to do the actual HTTP request.
       liveData->params.lastAbrpSent = liveData->params.currentTime;
       lastAbrpSendAtMs = millis();
+    }
 
-      WiFiClientSecure client;
-      HTTPClient http;
+    WiFiClientSecure client;
+    HTTPClient http;
 
-      client.setInsecure();
-      http.begin(client, "https://api.iternio.com/1/tlm/send");
-      http.setConnectTimeout(kAbrpHttpsConnectTimeoutMs);
-      http.setTimeout(kAbrpHttpsIoTimeoutMs);
-      http.setReuse(false);
-      http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-      const size_t bodyLength = static_cast<size_t>(dtaLength);
-      addWifiTransferredBytes(bodyLength);
-      syslog->println("ABRP POST body length: " + String(bodyLength));
-      rc = http.POST((uint8_t *)gAbrpFormBuffer, bodyLength);
+    client.setInsecure();
+    http.begin(client, "https://api.iternio.com/1/tlm/send");
+    http.setConnectTimeout(kAbrpHttpsConnectTimeoutMs);
+    http.setTimeout(kAbrpHttpsIoTimeoutMs);
+    http.setReuse(false);
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+    const size_t bodyLength = static_cast<size_t>(dtaLength);
+    addWifiTransferredBytes(bodyLength);
+    rc = http.POST((uint8_t *)gAbrpFormBuffer, bodyLength);
+
+    if (!fastPayload)
+    {
       syslog->println("ABRP HTTP status: " + String(rc));
-
-      if (rc == HTTP_CODE_OK)
+      if (rc > 0)
       {
-        // Request successful
-        String payload = http.getString();
+        const String payload = http.getString();
         syslog->println("ABRP HTTP response body: " + payload);
       }
-      else
-      {
-        // Handle different HTTP status codes
-        syslog->println("HTTP Request failed with code: " + String(rc));
-        if (rc > 0)
-        {
-          String payload = http.getString();
-          syslog->println("ABRP HTTP error body: " + payload);
-        }
-      }
-
-      http.end();
-      client.stop();
     }
 
-    if (rc == 200)
-    {
-      syslog->println("HTTP POST send successful");
-      liveData->params.lastSuccessNetSendTime = liveData->params.currentTime;
-      updateNetAvailability(true);
-    }
-    else
-    {
-      // Failed...
-      syslog->print("HTTP POST error: ");
-      syslog->println(rc);
-      updateNetAvailability(false);
-    }
+    http.end();
+    client.stop();
   }
-  else
+
+  if (rc == 200)
   {
-    syslog->println("Well... This not gonna happen... (Board320_240::netSendData();)"); // Just for debug reasons...
+    liveData->params.lastSuccessNetSendTime = liveData->params.currentTime;
+    updateNetAvailability(true);
+    return true;
   }
-  // next three rows are for time measurement of this function
-  int64_t endTime2 = esp_timer_get_time();
-  int64_t duration2 = endTime2 - startTime2;
-  // syslog->println("Time taken by function: netSendData() " + String(duration2) + " microseconds");
 
-  return true;
+  if (!fastPayload)
+  {
+    syslog->print("HTTP POST error: ");
+    syslog->println(rc);
+  }
+  updateNetAvailability(false);
+  return false;
 }
 
 void Board320_240::queueAbrpSdLog(const char *payload, size_t length, time_t currentTime, uint64_t operationTimeSec, bool timeSyncWithGps)
